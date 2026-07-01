@@ -16,7 +16,7 @@ export function getConfig() {
   }
 
   const rootPaths = (process.env.DICOM_ROOT_PATHS || '')
-    .split(',')
+    .split(/[;,]/)
     .map((s) => s.trim())
     .filter(Boolean);
 
