@@ -128,19 +128,19 @@ export function registerExploreTools(server, ctx) {
       let out = `## ${path.basename(file)}\n`;
       if (parsed.meta.transferSyntaxName) out += `Transfer Syntax: ${parsed.meta.transferSyntaxName} (${parsed.meta.transferSyntaxUid})\n`;
       if (parsed.warnings.length) out += `Warnings: ${parsed.warnings.join('; ')}\n`;
-      out += `\n| Tag | Name | VR | Value |\n|-----|------|----|-------|\n`;
+      out += `\n| Tag | Name | VR | VM | Value |\n|-----|------|----|----|-------|\n`;
 
       const f = filter?.toLowerCase();
       for (const el of parsed.elements) {
         if (el.isSequence) {
-          out += `| ${el.tagDisplay} | ${el.name || 'Sequence'} | SQ | (${el.items?.length || 0} item(s)) |\n`;
+          out += `| ${el.tagDisplay} | ${el.name || 'Sequence'} | SQ | ${el.vm || '1'} | (${el.items?.length || 0} item(s)) |\n`;
           continue;
         }
         const label = el.name || el.keyword || 'Unknown';
         if (f && !(`${label} ${el.keyword || ''} ${el.tag}`.toLowerCase().includes(f))) continue;
         const { display, masked } = renderTagValue(ctx, el.tag, el.value, { allowRaw });
         const phi = getPhiInfo(el.tag) ? ' 🔒' : '';
-        out += `| ${el.tagDisplay}${phi} | ${label} | ${el.vr} | ${truncate(display, 50)}${masked ? ' (masked)' : ''} |\n`;
+        out += `| ${el.tagDisplay}${phi} | ${label} | ${el.vr} | ${el.vm || '1'} | ${truncate(display, 50)}${masked ? ' (masked)' : ''} |\n`;
       }
       return { content: [{ type: 'text', text: out }] };
     }
@@ -170,7 +170,7 @@ export function registerExploreTools(server, ctx) {
         return { content: [{ type: 'text', text: `Tag ${formatTag(norm)} (${dict?.name || 'unknown'}) is not present in this file.` }] };
       }
       const { display, masked } = renderTagValue(ctx, el.tag, el.value, { allowRaw });
-      let out = `${el.tagDisplay} ${el.name || el.keyword || 'Unknown'} [${el.vr}]\n`;
+      let out = `${el.tagDisplay} ${el.name || el.keyword || 'Unknown'} [${el.vr}, VM ${el.vm || '1'}]\n`;
       out += `Value: ${display}${masked ? '  (PHI masked)' : ''}`;
       return { content: [{ type: 'text', text: out }] };
     }

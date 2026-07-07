@@ -97,6 +97,7 @@ function enumerate(dataSet, depth = 0) {
       keyword: dict?.keyword || null,
       name: dict?.name || null,
       vr,
+      vm: dict?.vm || null,
       length: element.length,
       depth,
       isSequence,

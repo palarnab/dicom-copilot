@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import path from 'node:path';
 import { parseFile, getTagValue, transferSyntaxName } from '../dicom/parser.js';
+import { scanFolder } from '../dicom/scanner.js';
 import { formatTag, lookupTag } from '../dicom/dictionary.js';
 import { renderTagValue, truncate } from './format.js';
 
@@ -20,6 +21,195 @@ const REQUIRED = [
 
 function firstVal(v) {
   return v === null || v === undefined ? null : String(v).split('\\')[0].trim();
+}
+
+// ---- Study-level comparison helpers -------------------------------------
+
+function setsEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
+/** Roll up a single study's series/image/modality/transfer-syntax totals. */
+function studyTotals(study) {
+  let images = 0;
+  const ts = new Set();
+  for (const s of study.series.values()) {
+    images += s.instances.length;
+    for (const t of s.transferSyntaxes) ts.add(t);
+  }
+  return { series: study.series.size, images, modalities: new Set(study.modalities), transferSyntaxes: ts };
+}
+
+/** Roll up an entire scanned folder (which may hold several studies). */
+function scanTotals(scan) {
+  let series = 0, images = 0;
+  const mods = new Set();
+  for (const st of scan.studies.values()) {
+    const t = studyTotals(st);
+    series += t.series;
+    images += t.images;
+    for (const m of t.modalities) mods.add(m);
+  }
+  return { studies: scan.studies.size, series, images, modalities: mods, patients: scan.patients.size };
+}
+
+/**
+ * Structural similarity score between two studies. UID-independent so it still
+ * pairs studies correctly after anonymization (which rewrites every UID).
+ */
+function studyMatchScore(a, b) {
+  const ta = studyTotals(a), tb = studyTotals(b);
+  const overlap = [...ta.modalities].filter((m) => tb.modalities.has(m)).length;
+  let s = overlap;
+  if (setsEqual(ta.modalities, tb.modalities)) s += 3;
+  if (ta.series === tb.series) s += 2;
+  if (ta.images === tb.images) s += 2;
+  return s;
+}
+
+/** Greedily pair A-side studies to their best structural match on the B side. */
+function pairStudies(studiesA, studiesB) {
+  const pairs = [];
+  const onlyA = [];
+  const remaining = new Set(studiesB);
+  for (const a of studiesA) {
+    let best = null, bestScore = 0;
+    for (const b of remaining) {
+      const score = studyMatchScore(a, b);
+      if (score > bestScore) { best = b; bestScore = score; }
+    }
+    if (best) { pairs.push([a, best]); remaining.delete(best); }
+    else onlyA.push(a);
+  }
+  return { pairs, onlyA, onlyB: [...remaining] };
+}
+
+/** Aggregate a study's series by a UID-independent key (modality + number). */
+function seriesAggregate(study) {
+  const m = new Map();
+  for (const s of study.series.values()) {
+    const key = `${s.modality || '?'}#${s.seriesNumber ?? '?'}`;
+    if (!m.has(key)) m.set(key, { seriesCount: 0, images: 0, descriptions: new Set() });
+    const e = m.get(key);
+    e.seriesCount++;
+    e.images += s.instances.length;
+    if (s.seriesDescription) e.descriptions.add(s.seriesDescription);
+  }
+  return m;
+}
+
+function shortUid(uid) {
+  return uid && uid.length > 16 ? `…${uid.slice(-16)}` : (uid || '(none)');
+}
+
+/**
+ * Build a study-level diff between two already-scanned folders.
+ * Pure (no I/O) so it can be unit/smoke tested directly.
+ * @returns {{ text: string, structurePreserved: boolean, uidsChanged: boolean }}
+ */
+export function compareStudyScans(scanA, scanB) {
+  const ta = scanTotals(scanA);
+  const tb = scanTotals(scanB);
+  const mark = (x, y) => (x === y ? '✓' : '⚠');
+  const modsA = [...ta.modalities].sort().join('/') || '?';
+  const modsB = [...tb.modalities].sort().join('/') || '?';
+
+  let out = `## Study-level comparison\n`;
+  out += `- A: ${scanA.root} — ${ta.studies} study, ${ta.series} series, ${ta.images} images\n`;
+  out += `- B: ${scanB.root} — ${tb.studies} study, ${tb.series} series, ${tb.images} images\n`;
+  if (scanA.errors.length || scanB.errors.length) {
+    out += `- Parse errors: A=${scanA.errors.length}, B=${scanB.errors.length}\n`;
+  }
+
+  out += `\n### Aggregate\n| Metric | A | B | |\n|--------|---|---|---|\n`;
+  out += `| Studies | ${ta.studies} | ${tb.studies} | ${mark(ta.studies, tb.studies)} |\n`;
+  out += `| Series | ${ta.series} | ${tb.series} | ${mark(ta.series, tb.series)} |\n`;
+  out += `| Images | ${ta.images} | ${tb.images} | ${mark(ta.images, tb.images)} |\n`;
+  out += `| Modalities | ${modsA} | ${modsB} | ${setsEqual(ta.modalities, tb.modalities) ? '✓' : '⚠'} |\n`;
+  out += `| Patients | ${ta.patients} | ${tb.patients} | ${mark(ta.patients, tb.patients)} |\n`;
+
+  const modsOnlyA = [...ta.modalities].filter((m) => !tb.modalities.has(m));
+  const modsOnlyB = [...tb.modalities].filter((m) => !ta.modalities.has(m));
+  if (modsOnlyA.length) out += `\n⚠ Modalities only in A: ${modsOnlyA.join(', ')}\n`;
+  if (modsOnlyB.length) out += `⚠ Modalities only in B: ${modsOnlyB.join(', ')}\n`;
+
+  // Pair studies structurally (UID-independent) and diff each pair.
+  const { pairs, onlyA, onlyB } = pairStudies([...scanA.studies.values()], [...scanB.studies.values()]);
+
+  let structurePreserved = onlyA.length === 0 && onlyB.length === 0;
+  let uidsChanged = false;
+
+  pairs.forEach(([a, b], i) => {
+    const pa = studyTotals(a), pb = studyTotals(b);
+    const uidSame = a.studyUid === b.studyUid;
+    if (!uidSame) uidsChanged = true;
+    const seriesMatch = pa.series === pb.series;
+    const imagesMatch = pa.images === pb.images;
+    const modsMatch = setsEqual(pa.modalities, pb.modalities);
+    if (!seriesMatch || !imagesMatch || !modsMatch) structurePreserved = false;
+
+    out += `\n### Study pair ${i + 1}\n`;
+    out += `| Attribute | A | B | |\n|-----------|---|---|---|\n`;
+    out += `| Study UID | ${shortUid(a.studyUid)} | ${shortUid(b.studyUid)} | ${uidSame ? '✓ same' : '✎ changed'} |\n`;
+    out += `| Patient ID | ${a.patientId ? 'set' : '(none)'} | ${b.patientId ? 'set' : '(none)'} | ${a.patientId === b.patientId ? '✓ same' : '✎ changed'} |\n`;
+    out += `| Accession | ${a.accessionNumber ? 'set' : '(none)'} | ${b.accessionNumber ? 'set' : '(none)'} | ${a.accessionNumber === b.accessionNumber ? '✓ same' : '✎ changed'} |\n`;
+    out += `| Study Date | ${a.studyDate || '(none)'} | ${b.studyDate || '(none)'} | ${a.studyDate === b.studyDate ? '✓' : '✎'} |\n`;
+    out += `| Description | ${truncate(a.studyDescription || '(none)', 24)} | ${truncate(b.studyDescription || '(none)', 24)} | ${a.studyDescription === b.studyDescription ? '✓' : '✎'} |\n`;
+    out += `| Modalities | ${[...pa.modalities].sort().join('/') || '?'} | ${[...pb.modalities].sort().join('/') || '?'} | ${modsMatch ? '✓' : '⚠'} |\n`;
+    out += `| Series | ${pa.series} | ${pb.series} | ${seriesMatch ? '✓' : '⚠'} |\n`;
+    out += `| Images | ${pa.images} | ${pb.images} | ${imagesMatch ? '✓' : '⚠'} |\n`;
+
+    // Series-level breakdown, matched by modality + series number.
+    const aggA = seriesAggregate(a);
+    const aggB = seriesAggregate(b);
+    const keys = [...new Set([...aggA.keys(), ...aggB.keys()])].sort();
+    const rows = [];
+    for (const key of keys) {
+      const ea = aggA.get(key);
+      const eb = aggB.get(key);
+      const imgA = ea?.images ?? 0;
+      const imgB = eb?.images ?? 0;
+      const flag = !ea ? '＋ only B' : !eb ? '－ only A' : imgA === imgB ? '✓' : `Δ ${imgB - imgA}`;
+      rows.push({ key, imgA, imgB, flag });
+    }
+    const mism = rows.filter((r) => r.flag !== '✓');
+    if (mism.length) {
+      out += `\n**Series differences (modality#seriesNumber):**\n| Series | A images | B images | |\n|--------|----------|----------|---|\n`;
+      for (const r of mism) out += `| ${r.key} | ${r.imgA} | ${r.imgB} | ${r.flag} |\n`;
+    } else {
+      out += `\nAll ${rows.length} series match by modality/number and image count. ✓\n`;
+    }
+  });
+
+  if (onlyA.length) {
+    out += `\n### Studies only in A (${onlyA.length})\n`;
+    for (const st of onlyA) {
+      const t = studyTotals(st);
+      out += `- [${[...t.modalities].join('/') || '?'}] ${truncate(st.studyDescription || '(none)', 40)} — ${t.series} series, ${t.images} images\n`;
+    }
+  }
+  if (onlyB.length) {
+    out += `\n### Studies only in B (${onlyB.length})\n`;
+    for (const st of onlyB) {
+      const t = studyTotals(st);
+      out += `- [${[...t.modalities].join('/') || '?'}] ${truncate(st.studyDescription || '(none)', 40)} — ${t.series} series, ${t.images} images\n`;
+    }
+  }
+
+  out += `\n### Verdict\n`;
+  if (structurePreserved) {
+    out += `✅ Structure preserved: same modalities, series, and image counts across all paired studies.\n`;
+    out += uidsChanged
+      ? `- UIDs were changed (expected for a de-identification/anonymization round-trip).\n`
+      : `- UIDs are identical (consistent with a straight copy/migration).\n`;
+  } else {
+    out += `⚠ Structural differences detected — review the tables above. This may indicate an incomplete migration or unintended data loss during de-identification.\n`;
+  }
+  out += `\n> Note: this compares metadata structure only. It does NOT compare pixel data or detect burned-in PHI.\n`;
+
+  return { text: out, structurePreserved, uidsChanged };
 }
 
 export function registerValidateTools(server, ctx) {
@@ -137,6 +327,29 @@ export function registerValidateTools(server, ctx) {
         for (const ad of added) out += `- ${formatTag(ad.tag)} ${ad.name}\n`;
       }
       return { content: [{ type: 'text', text: out }] };
+    }
+  );
+
+  server.tool(
+    'compare_studies',
+    'Study-LEVEL diff between two folders (not just two files): compares modalities, series counts, and image counts. Series are matched structurally (modality + series number), so it still works when UIDs were rewritten by anonymization. Ideal for verifying a migration copied everything, or that a de-identification round-trip preserved structure while changing identifiers. PHI identifiers are reported as same/changed only.',
+    {
+      folderA: z.string().describe('First study folder (e.g. the original / source)'),
+      folderB: z.string().describe('Second study folder (e.g. migrated / de-identified output)'),
+      maxFiles: z.number().optional().default(5000).describe('Max files to scan per folder (default 5000)'),
+    },
+    async ({ folderA, folderB, maxFiles }) => {
+      let scanA, scanB;
+      try { scanA = scanFolder(folderA, { maxFiles }); }
+      catch (e) { return { content: [{ type: 'text', text: `Cannot scan A: ${e.message}` }], isError: true }; }
+      try { scanB = scanFolder(folderB, { maxFiles }); }
+      catch (e) { return { content: [{ type: 'text', text: `Cannot scan B: ${e.message}` }], isError: true }; }
+
+      if (scanA.dicomCount === 0) return { content: [{ type: 'text', text: `No DICOM files found in A: ${scanA.root}` }] };
+      if (scanB.dicomCount === 0) return { content: [{ type: 'text', text: `No DICOM files found in B: ${scanB.root}` }] };
+
+      const { text } = compareStudyScans(scanA, scanB);
+      return { content: [{ type: 'text', text }] };
     }
   );
 }

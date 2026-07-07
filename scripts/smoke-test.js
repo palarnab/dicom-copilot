@@ -22,8 +22,8 @@ import { getPhiInfo } from '../src/dicom/phi-tags.js';
 import { DatasetIndex } from '../src/dicom/dataset.js';
 import { PiiClient } from '../src/services/pii-client.js';
 import { registerExploreTools } from '../src/tools/explore.js';
-import { registerValidateTools } from '../src/tools/validate.js';
-import { registerPhiTools } from '../src/tools/phi.js';
+import { registerValidateTools, compareStudyScans } from '../src/tools/validate.js';
+import { registerPhiTools, deidentifyFileToCopy } from '../src/tools/phi.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEST_DIR = path.resolve(__dirname, '../test-data');
@@ -147,6 +147,57 @@ async function main() {
   const pii = new PiiClient({ baseUrl: process.env.PII_SERVICE_URL || 'http://localhost:5001' });
   const health = await pii.health();
   console.log(health.ok ? `  ✓ reachable (HTTP ${health.status})` : `  ⚠ not reachable (${health.error || health.status}) — non-fatal`);
+
+  console.log('\nDe-identification writer:');
+  {
+    const outDir = path.join(TEST_DIR, '_deid_out');
+    fs.rmSync(outDir, { recursive: true, force: true });
+    const ctx = { pii: new PiiClient({ baseUrl: 'http://localhost:5001' }) };
+    const uidMap = new Map();
+    const outA = path.join(outDir, 'a.dcm');
+    const outB = path.join(outDir, 'b.dcm');
+    const rA = await deidentifyFileToCopy(TEST_FILE, outA, ctx, uidMap, { cleanFreeText: false });
+    await deidentifyFileToCopy(TEST_FILE, outB, ctx, uidMap, { cleanFreeText: false });
+
+    assert(rA.ok && fs.existsSync(outA), 'scrubbed copy written');
+    const orig = parseFile(TEST_FILE);
+    assert(String(getTagValue(orig, '00100010')).includes('SMITH'), 'original file left untouched');
+
+    const deid = parseFile(outA);
+    assert(deid.ok, 'scrubbed copy parses');
+    assert(!String(getTagValue(deid, '00100010')).includes('SMITH'), 'PatientName scrubbed in copy');
+    assert(getTagValue(deid, '0020000D') !== getTagValue(orig, '0020000D'), 'StudyInstanceUID remapped');
+    assert(String(getTagValue(deid, '00120062')) === 'YES', 'PatientIdentityRemoved stamped');
+
+    const deidB = parseFile(outB);
+    assert(getTagValue(deid, '0020000D') === getTagValue(deidB, '0020000D'), 'UID remap consistent across files');
+
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
+
+  console.log('\nStudy-level comparison:');
+  {
+    const cmpA = path.join(TEST_DIR, '_cmp_a');
+    const cmpB = path.join(TEST_DIR, '_cmp_b');
+    fs.rmSync(cmpA, { recursive: true, force: true });
+    fs.rmSync(cmpB, { recursive: true, force: true });
+    fs.mkdirSync(cmpA, { recursive: true });
+    const srcCopy = path.join(cmpA, 'orig.dcm');
+    fs.copyFileSync(TEST_FILE, srcCopy);
+
+    const ctx = { pii: new PiiClient({ baseUrl: 'http://localhost:5001' }) };
+    await deidentifyFileToCopy(srcCopy, path.join(cmpB, 'orig.dcm'), ctx, new Map(), { cleanFreeText: false });
+
+    const sA = scanFolder(cmpA, { maxFiles: 100 });
+    const sB = scanFolder(cmpB, { maxFiles: 100 });
+    const cmp = compareStudyScans(sA, sB);
+    assert(cmp.text.includes('Study-level comparison'), 'comparison report generated');
+    assert(cmp.structurePreserved, 'structure preserved across de-id round-trip');
+    assert(cmp.uidsChanged, 'UID change detected across round-trip');
+
+    fs.rmSync(cmpA, { recursive: true, force: true });
+    fs.rmSync(cmpB, { recursive: true, force: true });
+  }
 
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}: ${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);

@@ -10,13 +10,20 @@
  * VR); they simply won't have a friendly name. That is an honest, useful
  * trade-off that keeps the server dependency-light and fully offline.
  *
- * Each entry: { keyword, name, vr }
+ * Each curated entry: { keyword, name, vr }
  *   keyword — DICOM keyword (PascalCase, no spaces)
  *   name    — human friendly label
  *   vr      — default Value Representation (used when a file uses implicit VR)
+ *
+ * The curated table is merged on top of the *full* standard dictionary from
+ * `dcmjs`. Curated entries win (nicer human-spaced names); every other standard
+ * tag still resolves to a keyword, name, VR and VM — so previously-"unknown"
+ * tags now surface friendly metadata instead of raw hex.
  */
 
-export const DICTIONARY = {
+import { data as dcmjsData } from 'dcmjs';
+
+const CURATED = {
   // ---- File Meta Information (group 0002) ----
   '00020000': { keyword: 'FileMetaInformationGroupLength', name: 'File Meta Group Length', vr: 'UL' },
   '00020001': { keyword: 'FileMetaInformationVersion', name: 'File Meta Version', vr: 'OB' },
@@ -152,9 +159,69 @@ export const DICTIONARY = {
   '00081140': { keyword: 'ReferencedImageSequence', name: 'Referenced Image Sequence', vr: 'SQ' },
 };
 
-// Remove placeholder guard entries.
-for (const k of Object.keys(DICTIONARY)) {
-  if (!DICTIONARY[k].keyword) delete DICTIONARY[k];
+// Remove placeholder guard entries from the curated table.
+for (const k of Object.keys(CURATED)) {
+  if (!CURATED[k].keyword) delete CURATED[k];
+}
+
+/**
+ * Turn a DICOM keyword ("MRAcquisitionType") into a human-friendly, spaced
+ * label ("MR Acquisition Type"). Strips dcmjs's "RETIRED_" prefix.
+ */
+function humanizeKeyword(keyword) {
+  if (!keyword) return '';
+  return keyword
+    .replace(/^RETIRED_/, '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/([A-Za-z])([0-9])/g, '$1 $2')
+    .trim();
+}
+
+/**
+ * The full standard dictionary, derived once from dcmjs's name map and keyed by
+ * the normalized 8-hex tag. Loaded defensively: if dcmjs is ever unavailable the
+ * curated table still works on its own.
+ */
+const STANDARD = Object.create(null);
+try {
+  const nameMap = dcmjsData?.DicomMetaDictionary?.nameMap;
+  if (nameMap) {
+    for (const key of Object.keys(nameMap)) {
+      const entry = nameMap[key];
+      const norm = normalizeTag(entry?.tag);
+      if (norm.length !== 8) continue;
+      const retired = /^RETIRED_/.test(entry.name || '');
+      STANDARD[norm] = {
+        keyword: (entry.name || '').replace(/^RETIRED_/, ''),
+        name: humanizeKeyword(entry.name) + (retired ? ' (Retired)' : ''),
+        vr: entry.vr || 'UN',
+        vm: entry.vm || '1',
+        retired,
+      };
+    }
+  }
+} catch {
+  // dcmjs unavailable — fall back to the curated table only.
+}
+
+/**
+ * The effective dictionary: the full standard set overlaid with curated entries.
+ * Curated names/VRs win; VM is inherited from the standard entry when the curated
+ * one doesn't specify it.
+ */
+export const DICTIONARY = Object.create(null);
+for (const tag of Object.keys(STANDARD)) DICTIONARY[tag] = STANDARD[tag];
+for (const tag of Object.keys(CURATED)) {
+  const std = STANDARD[tag];
+  const cur = CURATED[tag];
+  DICTIONARY[tag] = {
+    keyword: cur.keyword,
+    name: cur.name,
+    vr: cur.vr,
+    vm: cur.vm || std?.vm || '1',
+    retired: std?.retired || false,
+  };
 }
 
 /** Normalize a dicom-parser tag ("x00100010") or "(0010,0010)" to "00100010". */
@@ -168,7 +235,21 @@ export function normalizeTag(tag) {
 
 /** Look up dictionary metadata for a tag. Returns null if unknown. */
 export function lookupTag(tag) {
-  return DICTIONARY[normalizeTag(tag)] || null;
+  const norm = normalizeTag(tag);
+  return DICTIONARY[norm] || maskedLookup(norm) || null;
+}
+
+/**
+ * Resolve repeating-group tags (overlays 60xx, curves 50xx) that the standard
+ * dictionary only lists under their base group (6000 / 5000).
+ */
+function maskedLookup(norm) {
+  if (norm.length !== 8) return null;
+  const group = norm.slice(0, 4);
+  const elem = norm.slice(4);
+  if (/^60[0-9A-F]{2}$/.test(group)) return DICTIONARY['6000' + elem] || null;
+  if (/^50[0-9A-F]{2}$/.test(group)) return DICTIONARY['5000' + elem] || null;
+  return null;
 }
 
 /** Format a tag as the canonical "(gggg,eeee)" display form. */

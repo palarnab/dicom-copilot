@@ -13,6 +13,7 @@ DICOM medical-imaging files.
 | [TECHNOLOGY-CHOICES.md](TECHNOLOGY-CHOICES.md) | Why each library/approach was chosen, trade-offs, and alternatives |
 | [SETUP.md](SETUP.md) | Install, configure, connect the PII service, and wire it into VS Code |
 | [USAGE.md](USAGE.md) | Every tool, its inputs/outputs, and copy-paste prompt recipes |
+| [QUESTIONS-AND-ANSWERS.md](QUESTIONS-AND-ANSWERS.md) | Question-first Q&A guide — 10 example questions, the tool each uses, and the response you get |
 
 ## 30-second overview
 
