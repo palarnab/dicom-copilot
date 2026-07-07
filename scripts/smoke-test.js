@@ -24,6 +24,7 @@ import { PiiClient } from '../src/services/pii-client.js';
 import { registerExploreTools } from '../src/tools/explore.js';
 import { registerValidateTools, compareStudyScans } from '../src/tools/validate.js';
 import { registerPhiTools, deidentifyFileToCopy } from '../src/tools/phi.js';
+import { registerExportTools } from '../src/tools/export.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEST_DIR = path.resolve(__dirname, '../test-data');
@@ -138,6 +139,7 @@ async function main() {
     registerExploreTools(server, ctx);
     registerValidateTools(server, ctx);
     registerPhiTools(server, ctx);
+    registerExportTools(server, ctx);
     assert(true, 'all tools registered without error');
   } catch (e) {
     assert(false, `tool registration failed: ${e.message}`);
