@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import path from 'node:path';
-import { parseFile, getTagValue, transferSyntaxName } from '../dicom/parser.js';
+import { parseFile, getTagValue, transferSyntaxName, transferSyntaxInfo } from '../dicom/parser.js';
 import { scanFolder } from '../dicom/scanner.js';
 import { formatTag, lookupTag } from '../dicom/dictionary.js';
 import { renderTagValue, truncate } from './format.js';
@@ -212,6 +212,258 @@ export function compareStudyScans(scanA, scanB) {
   return { text: out, structurePreserved, uidsChanged };
 }
 
+// ---- Transfer syntax / compression report ------------------------------
+
+/**
+ * Summarize compression (transfer syntaxes) across a scanned folder and flag
+ * any that a target PACS is configured to reject.
+ *
+ * Pure (no I/O). `accepted` is an optional list of transfer syntax UIDs or
+ * friendly-name substrings the target PACS supports (case-insensitive).
+ * @returns {{ text: string, unacceptedFiles: number, lossyFiles: number }}
+ */
+export function buildTransferSyntaxReport(scan, { accepted } = {}) {
+  // Normalize the accept-list to lowercase for substring/UID matching.
+  const acceptList = (accepted || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
+  const hasAcceptList = acceptList.length > 0;
+  const isAccepted = (uid, name) => {
+    if (!hasAcceptList) return true;
+    const u = (uid || '').toLowerCase();
+    const n = (name || '').toLowerCase();
+    return acceptList.some((a) => a === u || (n && n.includes(a)));
+  };
+
+  // Tally files per transfer syntax UID.
+  const counts = new Map(); // uid -> count
+  let total = 0;
+  for (const study of scan.studies.values()) {
+    for (const series of study.series.values()) {
+      for (const inst of series.instances) {
+        const uid = inst.transferSyntaxUid || '(none)';
+        counts.set(uid, (counts.get(uid) || 0) + 1);
+        total++;
+      }
+    }
+  }
+
+  const rows = [...counts.entries()].map(([uid, count]) => {
+    const info = uid === '(none)'
+      ? { uid, name: 'Missing (no meta header)', category: 'unknown', lossy: false }
+      : transferSyntaxInfo(uid);
+    return { ...info, uid, count, accepted: isAccepted(uid, info.name) };
+  }).sort((a, b) => b.count - a.count);
+
+  const pct = (n) => (total ? ((n / total) * 100).toFixed(1) : '0.0');
+  const catIcon = { uncompressed: '📦', lossless: '🗜', lossy: '⚠', unknown: '❓' };
+
+  let out = `## Transfer syntax report\n- Folder: ${scan.root}\n- Files analyzed: ${total} across ${scan.studies.size} study(ies)\n`;
+  if (scan.errors.length) out += `- Parse errors (excluded): ${scan.errors.length}\n`;
+
+  out += `\n| Transfer syntax | UID | Files | % | Category |${hasAcceptList ? ' Accepted |' : ''}\n`;
+  out += `|-----------------|-----|-------|---|----------|${hasAcceptList ? '----------|' : ''}\n`;
+  for (const r of rows) {
+    const cat = `${catIcon[r.category] || ''} ${r.category}`;
+    out += `| ${r.name} | ${r.uid} | ${r.count} | ${pct(r.count)}% | ${cat} |`;
+    out += hasAcceptList ? ` ${r.accepted ? '✓' : '❌ reject'} |\n` : `\n`;
+  }
+
+  // Compression rollup.
+  const sumBy = (cat) => rows.filter((r) => r.category === cat).reduce((s, r) => s + r.count, 0);
+  const uncompressed = sumBy('uncompressed');
+  const lossless = sumBy('lossless');
+  const lossyFiles = sumBy('lossy');
+  const unknown = sumBy('unknown');
+  out += `\n### Compression breakdown\n`;
+  out += `- 📦 Uncompressed: ${uncompressed} (${pct(uncompressed)}%)\n`;
+  out += `- 🗜 Compressed lossless: ${lossless} (${pct(lossless)}%)\n`;
+  out += `- ⚠ Compressed lossy: ${lossyFiles} (${pct(lossyFiles)}%)\n`;
+  if (unknown) out += `- ❓ Unknown/private/missing: ${unknown} (${pct(unknown)}%)\n`;
+
+  if (lossyFiles) {
+    out += `\n⚠ ${lossyFiles} file(s) use **lossy** compression — pixel data is irreversibly degraded; confirm this is acceptable for diagnostic/archival use.\n`;
+  }
+
+  // PACS acceptance flagging.
+  const rejected = rows.filter((r) => !r.accepted);
+  const unacceptedFiles = rejected.reduce((s, r) => s + r.count, 0);
+  if (hasAcceptList) {
+    out += `\n### Target PACS acceptance\n`;
+    if (unacceptedFiles === 0) {
+      out += `✅ All ${total} file(s) use transfer syntaxes the target PACS accepts.\n`;
+    } else {
+      out += `❌ ${unacceptedFiles} file(s) use transfer syntaxes the target PACS will **reject** — transcode before sending:\n`;
+      for (const r of rejected) out += `- ${r.name} (${r.uid}): ${r.count} file(s)\n`;
+    }
+  }
+
+  return { text: out, unacceptedFiles, lossyFiles };
+}
+
+// ---- Cross-file (study-level) conformance helpers ----------------------
+
+/** Parse a backslash-delimited numeric multi-value (e.g. ImagePositionPatient). */
+function numList(v) {
+  if (v === null || v === undefined) return [];
+  return String(v)
+    .split('\\')
+    .map((s) => parseFloat(s.trim()))
+    .filter((n) => Number.isFinite(n));
+}
+
+/** True when every number in the list is within `tol` of the first. */
+function nearlyEqualSpacing(deltas, tol) {
+  if (deltas.length === 0) return true;
+  const ref = deltas[0];
+  return deltas.every((d) => Math.abs(d - ref) <= tol);
+}
+
+/**
+ * Run cross-file conformance checks over a single scanned study. These catch
+ * PACS-ingestion failures that a per-file check cannot see: split frames of
+ * reference, missing slices, irregular spacing, duplicate/absent identifiers.
+ *
+ * Pure (no I/O) so it can be unit/smoke tested directly.
+ * @returns {{ issues: string[], warnings: string[], info: string[] }}
+ */
+export function validateStudyCrossFile(study) {
+  const issues = [];
+  const warnings = [];
+  const info = [];
+
+  // Duplicate SOP Instance UIDs across the whole study (all series).
+  const sopSeen = new Map(); // sop -> count
+  for (const series of study.series.values()) {
+    for (const inst of series.instances) {
+      const sop = inst.sopInstanceUid;
+      if (!sop) continue;
+      sopSeen.set(sop, (sopSeen.get(sop) || 0) + 1);
+    }
+  }
+  const dupSops = [...sopSeen.entries()].filter(([, n]) => n > 1);
+  if (dupSops.length) {
+    issues.push(
+      `${dupSops.length} duplicate SOP Instance UID(s) within the study — PACS will reject or silently drop the re-sent instances (e.g. ${shortUid(dupSops[0][0])} appears ${dupSops[0][1]}×).`
+    );
+  }
+
+  // Frame of Reference UIDs seen across the whole study (for orphan detection).
+  const studyForCounts = new Map(); // FoR -> number of series using it
+  for (const series of study.series.values()) {
+    const seriesFors = new Set(series.instances.map((i) => i.frameOfReferenceUid).filter(Boolean));
+    for (const f of seriesFors) studyForCounts.set(f, (studyForCounts.get(f) || 0) + 1);
+  }
+
+  for (const series of study.series.values()) {
+    const insts = series.instances;
+    const label = `Series ${series.seriesNumber ?? '?'} [${series.modality || '?'}]`;
+
+    // Orphaned series: hierarchy identifiers never resolved during ingestion.
+    if (series.seriesUid === 'UNKNOWN_SERIES' || !series.seriesUid) {
+      issues.push(`${label}: ${insts.length} instance(s) have no Series Instance UID (0020,000E) — orphaned, cannot be grouped by any PACS.`);
+    }
+
+    // Inconsistent FrameOfReferenceUID within the series.
+    const fors = new Set(insts.map((i) => i.frameOfReferenceUid).filter(Boolean));
+    if (fors.size > 1) {
+      issues.push(`${label}: inconsistent FrameOfReferenceUID (0020,0052) — ${fors.size} distinct values across ${insts.length} instances, which breaks 3D reconstruction and spatial registration.`);
+    } else if (fors.size === 1 && studyForCounts.size > 1 && studyForCounts.get([...fors][0]) === 1) {
+      // A series whose FoR is shared by no other series in a multi-frame-of-reference study.
+      warnings.push(`${label}: uses a FrameOfReferenceUID not shared by any other series — may be an orphaned/misregistered series if co-registration was expected.`);
+    }
+
+    // Gaps and duplicates in InstanceNumber.
+    const nums = insts
+      .map((i) => parseInt(i.instanceNumber, 10))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b);
+    if (nums.length >= 2) {
+      const seen = new Set();
+      const dupNums = new Set();
+      for (const n of nums) {
+        if (seen.has(n)) dupNums.add(n);
+        seen.add(n);
+      }
+      const missing = [];
+      for (let n = nums[0]; n <= nums[nums.length - 1]; n++) {
+        if (!seen.has(n)) missing.push(n);
+      }
+      if (dupNums.size) {
+        issues.push(`${label}: duplicate InstanceNumber(s) ${[...dupNums].slice(0, 8).join(', ')}${dupNums.size > 8 ? '…' : ''} — ordering is ambiguous.`);
+      }
+      if (missing.length) {
+        const preview = missing.slice(0, 8).join(', ');
+        issues.push(`${label}: ${missing.length} gap(s) in InstanceNumber (${nums[0]}–${nums[nums.length - 1]}); missing ${preview}${missing.length > 8 ? '…' : ''} — likely dropped slices during transfer.`);
+      }
+    } else if (insts.length > 1 && nums.length < insts.length) {
+      warnings.push(`${label}: ${insts.length - nums.length} instance(s) missing InstanceNumber (0020,0013) — cannot verify ordering completeness.`);
+    }
+
+    // Mismatched SliceThickness within the series.
+    const thick = new Set(insts.map((i) => i.sliceThickness).filter((v) => v !== null && v !== undefined));
+    if (thick.size > 1) {
+      issues.push(`${label}: mixed SliceThickness (0018,0050) values ${[...thick].slice(0, 6).join(', ')} — inconsistent acquisition geometry.`);
+    }
+
+    // Irregular slice spacing from ImagePositionPatient (z-axis heuristic).
+    const zs = insts
+      .map((i) => numList(i.imagePositionPatient))
+      .filter((p) => p.length === 3)
+      .map((p) => p[2])
+      .sort((a, b) => a - b);
+    if (zs.length >= 3) {
+      const deltas = [];
+      for (let k = 1; k < zs.length; k++) deltas.push(+(zs[k] - zs[k - 1]).toFixed(4));
+      const ref = deltas[0];
+      const tol = Math.max(0.01, Math.abs(ref) * 0.1); // 10% or 0.01mm, whichever larger
+      if (!nearlyEqualSpacing(deltas, tol)) {
+        const minD = Math.min(...deltas), maxD = Math.max(...deltas);
+        issues.push(`${label}: irregular slice spacing from ImagePositionPatient (0020,0032) — Δz ranges ${minD}–${maxD} mm; expected uniform spacing (missing slices or non-uniform acquisition).`);
+      } else {
+        info.push(`${label}: ${zs.length} slices, uniform Δz ≈ ${Math.abs(ref)} mm.`);
+      }
+    }
+  }
+
+  return { issues, warnings, info };
+}
+
+/**
+ * Format a full cross-file conformance report for one or more studies.
+ * Pure; returns { text, issueCount }.
+ */
+export function formatStudyValidation(studies, header) {
+  let out = `## Cross-file conformance report\n${header}\n`;
+  let issueCount = 0;
+
+  for (const study of studies) {
+    let nInst = 0;
+    for (const s of study.series.values()) nInst += s.instances.length;
+    const { issues, warnings, info } = validateStudyCrossFile(study);
+    issueCount += issues.length;
+
+    out += `\n### Study …${(study.studyUid || '?').slice(-16)} — ${truncate(study.studyDescription || '(no description)', 40)}\n`;
+    out += `- ${study.series.size} series, ${nInst} images, modalities: ${[...study.modalities].join('/') || '?'}\n`;
+
+    if (issues.length) {
+      out += `\n**❌ ${issues.length} issue(s):**\n`;
+      for (const i of issues) out += `- ${i}\n`;
+    } else {
+      out += `\n**✅ No cross-file issues detected.**\n`;
+    }
+    if (warnings.length) {
+      out += `\n**⚠ ${warnings.length} warning(s):**\n`;
+      for (const w of warnings) out += `- ${w}\n`;
+    }
+    if (info.length) {
+      out += `\n<details><summary>Info (${info.length})</summary>\n\n`;
+      for (const i of info) out += `- ${i}\n`;
+      out += `\n</details>\n`;
+    }
+  }
+
+  return { text: out, issueCount };
+}
+
 export function registerValidateTools(server, ctx) {
   server.tool(
     'validate_conformance',
@@ -349,6 +601,64 @@ export function registerValidateTools(server, ctx) {
       if (scanB.dicomCount === 0) return { content: [{ type: 'text', text: `No DICOM files found in B: ${scanB.root}` }] };
 
       const { text } = compareStudyScans(scanA, scanB);
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  server.tool(
+    'validate_study',
+    'Cross-file (study-LEVEL) conformance check that catches real-world PACS ingestion failures a single-file check cannot see: inconsistent FrameOfReferenceUID within a series, gaps or duplicates in InstanceNumber, mismatched SliceThickness, irregular slice spacing (from ImagePositionPatient), duplicate SOP Instance UIDs, and orphaned series (missing Series/Study UID). Scans a folder (or validates an already-scanned study by UID).',
+    {
+      path: z.string().optional().describe('Folder to scan and validate (all studies found). Omit to use a previously scanned study via studyUid.'),
+      studyUid: z.string().optional().describe('Validate a single already-scanned study by full or trailing Study Instance UID.'),
+      maxFiles: z.number().optional().default(5000).describe('Max files to scan when a folder path is given (default 5000)'),
+    },
+    async ({ path: folder, studyUid, maxFiles }) => {
+      let studies;
+      let header;
+
+      if (studyUid) {
+        const found = ctx.index.findStudy(studyUid);
+        if (!found) return { content: [{ type: 'text', text: `Study not found: ${studyUid}. Run scan_folder or pass a "path".` }], isError: true };
+        studies = [found.study];
+        header = `- Study: …${found.study.studyUid.slice(-16)} (${found.root})`;
+      } else if (folder) {
+        let scan;
+        try { scan = ctx.index.scan(folder, { maxFiles }); }
+        catch (e) { return { content: [{ type: 'text', text: `Cannot scan: ${e.message}` }], isError: true }; }
+        if (scan.dicomCount === 0) return { content: [{ type: 'text', text: `No DICOM files found in: ${scan.root}` }] };
+        studies = [...scan.studies.values()];
+        header = `- Folder: ${scan.root} — ${scan.studies.size} study(ies), ${scan.dicomCount} images${scan.errors.length ? `, ${scan.errors.length} parse error(s)` : ''}`;
+      } else {
+        return { content: [{ type: 'text', text: 'Provide either "path" (a folder to scan) or "studyUid" (a previously scanned study).' }], isError: true };
+      }
+
+      const { text, issueCount } = formatStudyValidation(studies, header);
+      const summary = issueCount ? `\n---\n**${issueCount} cross-file issue(s) total.**\n` : `\n---\n**All studies passed cross-file checks.**\n`;
+      return { content: [{ type: 'text', text: text + summary }] };
+    }
+  );
+
+  server.tool(
+    'transfer_syntax_report',
+    'Summarize compression (transfer syntaxes) across a folder: how many files are uncompressed vs JPEG 2000 / JPEG / RLE, with a lossy-vs-lossless breakdown. Optionally flags files whose transfer syntax a target PACS will not accept, so you know what to transcode before sending.',
+    {
+      path: z.string().optional().describe('Folder to scan (defaults to the most recent scan).'),
+      accepted: z.array(z.string()).optional().describe('Transfer syntaxes the TARGET PACS accepts — UIDs (e.g. 1.2.840.10008.1.2.1) or name substrings (e.g. "JPEG 2000", "Explicit VR"). Files using anything else are flagged for transcoding.'),
+      maxFiles: z.number().optional().default(5000).describe('Max files to scan when a folder path is given (default 5000)'),
+    },
+    async ({ path: folder, accepted, maxFiles }) => {
+      let scan;
+      if (folder) {
+        try { scan = ctx.index.scan(folder, { maxFiles }); }
+        catch (e) { return { content: [{ type: 'text', text: `Cannot scan: ${e.message}` }], isError: true }; }
+      } else {
+        scan = ctx.index.getScan();
+        if (!scan) return { content: [{ type: 'text', text: 'No scan available. Provide "path" or run scan_folder first.' }], isError: true };
+      }
+      if (scan.dicomCount === 0) return { content: [{ type: 'text', text: `No DICOM files found in: ${scan.root}` }] };
+
+      const { text } = buildTransferSyntaxReport(scan, { accepted });
       return { content: [{ type: 'text', text }] };
     }
   );

@@ -130,6 +130,13 @@ export function scanFolder(rootPath, { maxFiles = 20000 } = {}) {
       rows: firstValue(getTagValue(parsed, '00280010')),
       columns: firstValue(getTagValue(parsed, '00280011')),
       burnedInAnnotation: firstValue(getTagValue(parsed, '00280301')),
+      transferSyntaxUid: parsed.meta.transferSyntaxUid || null,
+      // Spatial / geometry fields used by cross-file study validation.
+      frameOfReferenceUid: firstValue(getTagValue(parsed, '00200052')),
+      sliceThickness: firstValue(getTagValue(parsed, '00180050')),
+      spacingBetweenSlices: firstValue(getTagValue(parsed, '00180088')),
+      pixelSpacing: getTagValue(parsed, '00280030'),
+      imagePositionPatient: getTagValue(parsed, '00200032'),
     });
   }
 

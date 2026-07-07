@@ -22,8 +22,7 @@ import { getPhiInfo } from '../src/dicom/phi-tags.js';
 import { DatasetIndex } from '../src/dicom/dataset.js';
 import { PiiClient } from '../src/services/pii-client.js';
 import { registerExploreTools } from '../src/tools/explore.js';
-import { registerValidateTools, compareStudyScans } from '../src/tools/validate.js';
-import { registerPhiTools, deidentifyFileToCopy } from '../src/tools/phi.js';
+import { registerValidateTools, compareStudyScans, validateStudyCrossFile, buildTransferSyntaxReport } from '../src/tools/validate.js';import { registerPhiTools, deidentifyFileToCopy } from '../src/tools/phi.js';
 import { registerExportTools } from '../src/tools/export.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -199,6 +198,99 @@ async function main() {
 
     fs.rmSync(cmpA, { recursive: true, force: true });
     fs.rmSync(cmpB, { recursive: true, force: true });
+  }
+
+  console.log('\nCross-file study validation:');
+  {
+    // A clean study: 3 consecutive slices, one FoR, uniform 2mm spacing.
+    const mkInst = (n, extra = {}) => ({
+      sopInstanceUid: `1.2.3.${n}`,
+      instanceNumber: String(n),
+      frameOfReferenceUid: '1.2.3.FOR',
+      sliceThickness: '2.0',
+      imagePositionPatient: `0\\0\\${(n - 1) * 2}`,
+      ...extra,
+    });
+    const cleanStudy = {
+      studyUid: '1.2.3.CLEAN',
+      studyDescription: 'Clean',
+      modalities: new Set(['CT']),
+      series: new Map([['s1', {
+        seriesUid: 's1', seriesNumber: '1', modality: 'CT',
+        instances: [mkInst(1), mkInst(2), mkInst(3)],
+      }]]),
+    };
+    const clean = validateStudyCrossFile(cleanStudy);
+    assert(clean.issues.length === 0, 'clean study reports no cross-file issues');
+
+    // A broken study: missing slice #3, mixed FoR, duplicate SOP, mixed thickness.
+    const brokenStudy = {
+      studyUid: '1.2.3.BROKEN',
+      studyDescription: 'Broken',
+      modalities: new Set(['CT']),
+      series: new Map([['s1', {
+        seriesUid: 's1', seriesNumber: '1', modality: 'CT',
+        instances: [
+          mkInst(1),
+          mkInst(2, { frameOfReferenceUid: '1.2.3.OTHER', sliceThickness: '5.0' }),
+          mkInst(4, { sopInstanceUid: '1.2.3.1' }), // dup SOP with slice 1, gap at 3
+        ],
+      }]]),
+    };
+    const broken = validateStudyCrossFile(brokenStudy);
+    assert(broken.issues.some((i) => /FrameOfReferenceUID/.test(i)), 'detects inconsistent FrameOfReferenceUID');
+    assert(broken.issues.some((i) => /gap.*InstanceNumber/i.test(i)), 'detects InstanceNumber gap');
+    assert(broken.issues.some((i) => /duplicate SOP Instance UID/i.test(i)), 'detects duplicate SOP Instance UID');
+    assert(broken.issues.some((i) => /SliceThickness/.test(i)), 'detects mixed SliceThickness');
+
+    // An orphaned series: no Series Instance UID.
+    const orphanStudy = {
+      studyUid: '1.2.3.ORPHAN',
+      studyDescription: 'Orphan',
+      modalities: new Set(['CT']),
+      series: new Map([['UNKNOWN_SERIES', {
+        seriesUid: 'UNKNOWN_SERIES', seriesNumber: null, modality: 'CT',
+        instances: [mkInst(1)],
+      }]]),
+    };
+    const orphan = validateStudyCrossFile(orphanStudy);
+    assert(orphan.issues.some((i) => /orphaned/i.test(i)), 'detects orphaned series (missing Series UID)');
+  }
+
+  console.log('\nTransfer syntax report:');
+  {
+    // A mixed scan: 2 uncompressed, 1 JPEG 2000 (lossy), 1 JPEG Baseline (lossy).
+    const mkInst = (sop, ts) => ({ sopInstanceUid: sop, transferSyntaxUid: ts });
+    const scan = {
+      root: '/fake/mixed',
+      studies: new Map([['1.2.3', {
+        studyUid: '1.2.3', modalities: new Set(['CT']),
+        series: new Map([['s1', {
+          seriesUid: 's1', instances: [
+            mkInst('a', '1.2.840.10008.1.2.1'),   // Explicit VR LE (uncompressed)
+            mkInst('b', '1.2.840.10008.1.2.1'),   // Explicit VR LE (uncompressed)
+            mkInst('c', '1.2.840.10008.1.2.4.91'), // JPEG 2000 (lossy)
+            mkInst('d', '1.2.840.10008.1.2.4.50'), // JPEG Baseline (lossy)
+          ],
+        }]]),
+      }]]),
+      errors: [],
+    };
+
+    const rpt = buildTransferSyntaxReport(scan);
+    assert(rpt.text.includes('Transfer syntax report'), 'report generated');
+    assert(rpt.lossyFiles === 2, 'counts lossy files (JPEG 2000 + JPEG Baseline)');
+    assert(rpt.text.includes('JPEG 2000'), 'names JPEG 2000 transfer syntax');
+    assert(rpt.text.includes('Uncompressed: 2'), 'counts uncompressed files');
+
+    // With a target PACS that only accepts uncompressed Explicit VR LE.
+    const gated = buildTransferSyntaxReport(scan, { accepted: ['1.2.840.10008.1.2.1'] });
+    assert(gated.unacceptedFiles === 2, 'flags files the target PACS rejects');
+    assert(gated.text.includes('reject'), 'report marks rejected syntaxes');
+
+    // Name-substring acceptance should also work.
+    const byName = buildTransferSyntaxReport(scan, { accepted: ['Explicit VR', 'JPEG 2000'] });
+    assert(byName.unacceptedFiles === 1, 'name-substring accept-list leaves only JPEG Baseline rejected');
   }
 
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}: ${passed} passed, ${failed} failed`);

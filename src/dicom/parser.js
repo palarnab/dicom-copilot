@@ -36,6 +36,40 @@ export function transferSyntaxName(uid) {
   return TRANSFER_SYNTAXES[uid] || 'Unknown / private';
 }
 
+// Compression category for each known transfer syntax. Lossy syntaxes are
+// irreversible; many PACS/archival profiles restrict or reject them.
+const TRANSFER_SYNTAX_CATEGORY = {
+  '1.2.840.10008.1.2': 'uncompressed',
+  '1.2.840.10008.1.2.1': 'uncompressed',
+  '1.2.840.10008.1.2.1.99': 'uncompressed', // deflated = lossless byte packing
+  '1.2.840.10008.1.2.2': 'uncompressed',
+  '1.2.840.10008.1.2.4.50': 'lossy',
+  '1.2.840.10008.1.2.4.51': 'lossy',
+  '1.2.840.10008.1.2.4.57': 'lossless',
+  '1.2.840.10008.1.2.4.70': 'lossless',
+  '1.2.840.10008.1.2.4.80': 'lossless',
+  '1.2.840.10008.1.2.4.81': 'lossy',
+  '1.2.840.10008.1.2.4.90': 'lossless',
+  '1.2.840.10008.1.2.4.91': 'lossy',
+  '1.2.840.10008.1.2.5': 'lossless',
+};
+
+/**
+ * Classify a transfer syntax UID.
+ * @returns {{ uid: string, name: string, category: 'uncompressed'|'lossless'|'lossy'|'unknown', compressed: boolean, lossy: boolean }}
+ */
+export function transferSyntaxInfo(uid) {
+  const name = transferSyntaxName(uid);
+  const category = TRANSFER_SYNTAX_CATEGORY[uid] || 'unknown';
+  return {
+    uid,
+    name,
+    category,
+    compressed: category === 'lossless' || category === 'lossy',
+    lossy: category === 'lossy',
+  };
+}
+
 function readNumbers(dataSet, tag, length, size, method) {
   const count = Math.min(Math.floor(length / size), 32);
   const out = [];
