@@ -97,6 +97,30 @@ Look up one tag by number (`(0010,0010)` / `00100010`) or keyword
 
 ---
 
+### `read_report`
+
+Render the human-readable content of a DICOM **report** file. Handles three
+shapes: native **Structured Reports (SR)** (walks the nested `ContentSequence`
+into a readable outline), **Encapsulated PDF** (extracts and text-parses the
+embedded PDF), and **Encapsulated CDA / XML** (decodes the embedded document).
+
+Narrative free text (SR `TEXT`/`PNAME` items, PDF/XML body) is scanned by the
+PII service and detected spans are **redacted** before it reaches the model. If
+the PII service is unavailable, the narrative is **withheld** by default rather
+than leaked; structure and coded values are still shown. Raw narrative is only
+returned with `allowRaw: true` **and** a server configured to allow raw PHI.
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `file` | string | Path to a `.dcm` SR or encapsulated PDF/CDA/XML file |
+| `allowRaw` | boolean (optional) | Return unredacted narrative (honored only if server allows) |
+| `maxChars` | number (optional) | Max characters of narrative/body to return (default 20000) |
+
+**Prompt:** *"Read the report in `sr/report001.dcm`."* ·
+*"Extract the text of the encapsulated PDF in `docs/discharge.dcm`."*
+
+---
+
 ## Validate tools
 
 ### `validate_conformance`

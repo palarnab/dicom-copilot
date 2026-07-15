@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-import { parseFile, getTagValue } from '../src/dicom/parser.js';
+import { parseFile, getTagValue, extractElementBytes } from '../src/dicom/parser.js';
 import { scanFolder } from '../src/dicom/scanner.js';
 import { getPhiInfo } from '../src/dicom/phi-tags.js';
 import { DatasetIndex } from '../src/dicom/dataset.js';
@@ -24,6 +24,7 @@ import { PiiClient } from '../src/services/pii-client.js';
 import { registerExploreTools } from '../src/tools/explore.js';
 import { registerValidateTools, compareStudyScans, validateStudyCrossFile, buildTransferSyntaxReport } from '../src/tools/validate.js';import { registerPhiTools, deidentifyFileToCopy } from '../src/tools/phi.js';
 import { registerExportTools } from '../src/tools/export.js';
+import { registerReportTools, detectReportKind, collectSr } from '../src/tools/report.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEST_DIR = path.resolve(__dirname, '../test-data');
@@ -103,6 +104,72 @@ function buildSyntheticDicom() {
   return Buffer.concat([preamble, meta, dataset]);
 }
 
+// ---- Synthetic report builders (SR + encapsulated document) -------------
+function seqItem(dataBuf) {
+  const h = Buffer.alloc(8);
+  h.writeUInt16LE(0xfffe, 0); h.writeUInt16LE(0xe000, 2);
+  h.writeUInt32LE(dataBuf.length, 4);
+  return Buffer.concat([h, dataBuf]);
+}
+
+function codeSeq(group, element, value, scheme, meaning) {
+  const itemData = Buffer.concat([
+    encElem(0x0008, 0x0100, 'SH', strVal('SH', value)),
+    encElem(0x0008, 0x0102, 'SH', strVal('SH', scheme)),
+    encElem(0x0008, 0x0104, 'LO', strVal('LO', meaning)),
+  ]);
+  return encElem(group, element, 'SQ', seqItem(itemData));
+}
+
+function buildMeta(sopClass, sopInst) {
+  const ts = '1.2.840.10008.1.2.1'; // Explicit VR LE
+  const metaBody = Buffer.concat([
+    encElem(0x0002, 0x0002, 'UI', strVal('UI', sopClass)),
+    encElem(0x0002, 0x0003, 'UI', strVal('UI', sopInst)),
+    encElem(0x0002, 0x0010, 'UI', strVal('UI', ts)),
+    encElem(0x0002, 0x0012, 'UI', strVal('UI', '1.2.826.0.1.3680043.9.9999')),
+  ]);
+  const meta = Buffer.concat([
+    encElem(0x0002, 0x0000, 'UL', ul(metaBody.length)),
+    metaBody,
+  ]);
+  return Buffer.concat([Buffer.alloc(128), Buffer.from('DICM', 'ascii'), meta]);
+}
+
+function buildSyntheticSr(sopClass) {
+  const sopInst = '1.2.3.4.5.6.7.8.9.11';
+  const textItem = Buffer.concat([
+    encElem(0x0040, 0xa010, 'CS', strVal('CS', 'CONTAINS')),
+    encElem(0x0040, 0xa040, 'CS', strVal('CS', 'TEXT')),
+    codeSeq(0x0040, 0xa043, '121071', 'DCM', 'Finding'),
+    encElem(0x0040, 0xa160, 'UT', strVal('UT', 'No acute findings. Patient stable.')),
+  ]);
+  const dataset = Buffer.concat([
+    encElem(0x0008, 0x0016, 'UI', strVal('UI', sopClass)),
+    encElem(0x0008, 0x0018, 'UI', strVal('UI', sopInst)),
+    encElem(0x0008, 0x0060, 'CS', strVal('CS', 'SR')),
+    encElem(0x0040, 0xa040, 'CS', strVal('CS', 'CONTAINER')),
+    codeSeq(0x0040, 0xa043, '11528-7', 'LN', 'Radiology Report'),
+    encElem(0x0040, 0xa730, 'SQ', seqItem(textItem)),
+  ]);
+  return Buffer.concat([buildMeta(sopClass, sopInst), dataset]);
+}
+
+function buildSyntheticEncapsulated(sopClass, mime, docBytes) {
+  const sopInst = '1.2.3.4.5.6.7.8.9.12';
+  let payload = docBytes;
+  if (payload.length % 2 !== 0) payload = Buffer.concat([payload, Buffer.from([0x00])]);
+  const dataset = Buffer.concat([
+    encElem(0x0008, 0x0016, 'UI', strVal('UI', sopClass)),
+    encElem(0x0008, 0x0018, 'UI', strVal('UI', sopInst)),
+    encElem(0x0042, 0x0010, 'ST', strVal('ST', 'Discharge Summary')),
+    encElem(0x0042, 0x0011, 'OB', payload),
+    encElem(0x0042, 0x0012, 'LO', strVal('LO', mime)),
+    encElem(0x0042, 0x0015, 'UL', ul(docBytes.length)),
+  ]);
+  return Buffer.concat([buildMeta(sopClass, sopInst), dataset]);
+}
+
 async function main() {
   console.log('DICOM Copilot smoke test\n');
 
@@ -139,9 +206,42 @@ async function main() {
     registerValidateTools(server, ctx);
     registerPhiTools(server, ctx);
     registerExportTools(server, ctx);
+    registerReportTools(server, ctx);
     assert(true, 'all tools registered without error');
   } catch (e) {
     assert(false, `tool registration failed: ${e.message}`);
+  }
+
+  console.log('\nReport reader (SR + encapsulated):');
+  {
+    // (a) Native Structured Report — verify the content tree is walked.
+    const srSop = '1.2.840.10008.5.1.4.1.1.88.11'; // Basic Text SR
+    const srFile = path.join(TEST_DIR, '_report_sr.dcm');
+    fs.writeFileSync(srFile, buildSyntheticSr(srSop));
+    const srParsed = parseFile(srFile);
+    assert(srParsed.ok, 'SR file parses');
+    assert(detectReportKind(srParsed) === 'sr', 'SR detected as structured report');
+    const sr = collectSr(srParsed);
+    assert(sr.docTitle === 'Radiology Report', 'SR document title decoded');
+    assert(sr.entries.some((e) => e.valueType === 'TEXT') && sr.narrative.length >= 1, 'SR TEXT content item collected');
+    assert(sr.narrative[0].includes('No acute findings'), 'SR narrative text decoded');
+
+    // (b) Encapsulated CDA/XML — verify the OB payload is extracted verbatim.
+    const xmlSop = '1.2.840.10008.5.1.4.1.1.104.2';
+    const xmlBody = '<?xml version="1.0"?><ClinicalDocument><text>Impression: normal.</text></ClinicalDocument>';
+    const xmlFile = path.join(TEST_DIR, '_report_cda.dcm');
+    fs.writeFileSync(xmlFile, buildSyntheticEncapsulated(xmlSop, 'text/xml', Buffer.from(xmlBody, 'utf8')));
+    const xmlParsed = parseFile(xmlFile);
+    assert(xmlParsed.ok, 'encapsulated CDA parses');
+    assert(detectReportKind(xmlParsed) === 'xml', 'encapsulated CDA detected as xml');
+    const ex = extractElementBytes(xmlFile, '00420011');
+    assert(ex.ok && ex.bytes.toString('utf8') === xmlBody, 'encapsulated XML bytes extracted verbatim');
+
+    // (c) A plain image is not a report.
+    assert(detectReportKind(parseFile(TEST_FILE)) === 'none', 'CT image not treated as a report');
+
+    fs.rmSync(srFile, { force: true });
+    fs.rmSync(xmlFile, { force: true });
   }
 
   console.log('\nPII service (optional):');

@@ -212,3 +212,53 @@ export function getTagValue(parsed, tag) {
   const el = parsed.byTag?.[normalizeTag(tag)];
   return el ? el.value : null;
 }
+
+/**
+ * Extract the raw bytes of a single top-level element (e.g. an encapsulated
+ * PDF/CDA/XML document in tag 0042,0011). The parser deliberately never decodes
+ * binary blobs during normal enumeration; this is the opt-in escape hatch used
+ * by the report reader. Returns a detached copy so the underlying file buffer
+ * can be released.
+ * @returns {{ ok: boolean, bytes?: Buffer, vr?: string, error?: string }}
+ */
+export function extractElementBytes(filePath, tag) {
+  let byteArray;
+  try {
+    byteArray = new Uint8Array(fs.readFileSync(filePath));
+  } catch (e) {
+    return { ok: false, error: `Cannot read file: ${e.message}` };
+  }
+
+  let dataSet;
+  try {
+    dataSet = dicomParser.parseDicom(byteArray);
+  } catch (e) {
+    if (e && e.dataSet) dataSet = e.dataSet;
+    else return { ok: false, error: `Not a parseable DICOM file: ${e.message || e}` };
+  }
+
+  const norm = normalizeTag(tag);
+  const key = 'x' + norm.toLowerCase();
+  const el = dataSet.elements[key];
+  if (!el) return { ok: false, error: `Element ${formatTag(norm)} is not present in this file.` };
+
+  if (typeof el.dataOffset !== 'number' || typeof el.length !== 'number' || el.length < 0) {
+    return { ok: false, error: `Element ${formatTag(norm)} is fragmented or has no readable length.` };
+  }
+
+  // Copy the slice so it no longer references the whole-file buffer.
+  let bytes = Buffer.from(dataSet.byteArray.subarray(el.dataOffset, el.dataOffset + el.length));
+
+  // Encapsulated documents are padded to an even length. If the real length is
+  // recorded in EncapsulatedDocumentLength (0042,0015), trust it; otherwise trim
+  // a single trailing null pad byte.
+  let realLen;
+  try { realLen = dataSet.uint32('x00420015'); } catch { realLen = undefined; }
+  if (Number.isInteger(realLen) && realLen > 0 && realLen <= bytes.length) {
+    bytes = bytes.subarray(0, realLen);
+  } else if (bytes.length && bytes[bytes.length - 1] === 0x00) {
+    bytes = bytes.subarray(0, bytes.length - 1);
+  }
+
+  return { ok: true, bytes, vr: el.vr };
+}

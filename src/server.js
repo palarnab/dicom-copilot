@@ -10,6 +10,7 @@ import { registerExploreTools } from './tools/explore.js';
 import { registerValidateTools } from './tools/validate.js';
 import { registerPhiTools } from './tools/phi.js';
 import { registerExportTools } from './tools/export.js';
+import { registerReportTools } from './tools/report.js';
 
 const VERSION = '1.0.0';
 
@@ -29,6 +30,7 @@ export async function createServer() {
   registerValidateTools(server, ctx);
   registerPhiTools(server, ctx);
   registerExportTools(server, ctx);
+  registerReportTools(server, ctx);
 
   // Resource: current dataset / configuration snapshot.
   server.resource(
